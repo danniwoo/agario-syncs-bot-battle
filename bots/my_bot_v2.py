@@ -1,3 +1,15 @@
+# v2 builds on top of my_bot_v1.py (Stage 1 - 3c). New in this file:
+#   Stage 3d - 威脅 + 病毒合併成同一個加權向量（v1 遇到威脅時會直接 return，
+#              完全跳過病毒檢查，逃跑路線可能直接撞上病毒）
+#   Stage 3e - 用「每一顆 blob 各自的質量」取代「聚合質量」做戰鬥判定：引擎是
+#              一顆一顆 blob 分開吃的（engine/state/state_mutator.py
+#              _resolve_player_eating），me.radius 只是 sqrt(所有 blob mass
+#              總和)，是排行榜用的聚合值，不是戰鬥判定用的數字。被病毒炸成
+#              好幾塊之後，用聚合值算會嚴重低估危險：敵人可能吃不掉「全部加
+#              起來」但吃得掉「其中一小塊」。逃跑用最弱一塊的質量（保守，
+#              有任何一塊可能被吃就跑，因為全部 blob 只能往同一個方向移動，
+#              保護最弱的一塊等於保護全部），病毒免疫/獵殺能力用最強一塊的
+#              質量（只有最大那塊有實際攻擊力）。
 import math
 
 from helper.game import Game
@@ -16,17 +28,13 @@ HUNT_MASS_RATIO = 0.7
 # cornered (pinned against two walls with no escape heading). Start pushing back
 # once we're within this many units of a wall.
 BOUNDARY_MARGIN = 5.0
-# How many ticks ahead we extrapolate a prey's position, using its measured
-# velocity once we've seen it move, or a naive "fleeing straight away from us"
-# guess the first tick we spot it.
-INTERCEPT_LOOKAHEAD_TICKS = 4.0
-# Movement speed is max(MIN_PLAYER_SPEED, BASE_PLAYER_SPEED / (1 + radius * k)),
-# strictly decreasing in radius -- so anything under HUNT_MASS_RATIO is smaller
-# AND always faster than us. A tail chase in open space mathematically never
-# closes the gap; the only way we ever catch prey on open ground is by cutting
-# an angle rather than racing it in a straight line. This is how far to the
-# side of the predicted position we aim instead of trailing directly behind.
-FLANK_OFFSET = 2.0
+# How far ahead along its naive flee heading we predict a prey's position, so we
+# aim at where it's going rather than where it is right now.
+INTERCEPT_LOOKAHEAD = 4.0
+# Extra margin beyond the exact collision radius to start steering around a
+# virus we're big enough to be split by (VirusModel exposes its own radius, so
+# we don't need to hardcode VIRUS_SIZE here).
+VIRUS_AVOIDANCE_BUFFER = 2.0
 # How many rounds to let a chase run before checking whether it's actually
 # closing the distance.
 GIVE_UP_WINDOW_ROUNDS = 15
@@ -39,34 +47,123 @@ def _mass(radius: float) -> float:
     return radius * radius
 
 
-def _boundary_push(x: float, y: float, size: float) -> tuple[float, float]:
-    """Vector pointing inward, away from any wall within BOUNDARY_MARGIN; zero if clear.
+def _weakest_and_strongest_mass(me) -> tuple[float, float]:
+    """Our own blobs' mass range (post-split we may have several).
 
-    Magnitude grows the closer we are to a wall, so it naturally combines into a
-    diagonal push when we're near a corner (close to two walls at once).
+    Combat is resolved per individual blob, not by total mass (see the Stage
+    3e note above) -- use the weakest blob for "can I be eaten" checks and the
+    strongest for "can I eat/survive this" checks.
     """
-    push_x = 0.0
-    if x < BOUNDARY_MARGIN:
-        push_x = BOUNDARY_MARGIN - x
-    elif x > size - BOUNDARY_MARGIN:
-        push_x = (size - BOUNDARY_MARGIN) - x
+    blob_masses = [_mass(blob.radius) for blob in me.blobs.values()]
+    return min(blob_masses), max(blob_masses)
 
-    push_y = 0.0
-    if y < BOUNDARY_MARGIN:
-        push_y = BOUNDARY_MARGIN - y
-    elif y > size - BOUNDARY_MARGIN:
-        push_y = (size - BOUNDARY_MARGIN) - y
 
+def _slide_off_walls(dx: float, dy: float, x: float, y: float, size: float) -> tuple[float, float]:
+    """Redirect a direction vector so it never fights a wall we're already near.
+
+    The engine normalises our (dx, dy) but treats an exact (0, 0) as "don't move
+    this tick" -- so adding a separate push-away-from-wall vector on top of the
+    flee vector can partially or fully cancel it out whenever a threat happens to
+    be pushing us toward the wall we're already hugging, leaving us stuck
+    oscillating in place. Zeroing the wall-ward component instead (rather than
+    opposing it with another vector) avoids that cancellation and just slides us
+    along the wall using whatever component was already available.
+    """
+    if x < BOUNDARY_MARGIN and dx < 0:
+        dx = 0.0
+    elif x > size - BOUNDARY_MARGIN and dx > 0:
+        dx = 0.0
+    if y < BOUNDARY_MARGIN and dy < 0:
+        dy = 0.0
+    elif y > size - BOUNDARY_MARGIN and dy > 0:
+        dy = 0.0
+
+    if dx == 0.0 and dy == 0.0:
+        # Pinned against two walls at once with no lateral component left: the
+        # only way out is back toward the centre.
+        return (size / 2.0 - x, size / 2.0 - y)
+    return (dx, dy)
+
+
+def _repulsion_vector(me_x: float, me_y: float, danger_positions) -> tuple[float, float]:
+    """Sum a weighted repulsion vector away from every position in
+    danger_positions (closer ones push harder), instead of reacting to only
+    the single nearest one.
+
+    Picking just the nearest danger means its identity can flip between two
+    similarly-distant ones from one tick to the next, flipping our direction
+    ~180 degrees and cancelling the previous tick's movement -- this is what
+    caused the "shaking in place" behaviour. A continuous weighted sum doesn't
+    have that discrete flip.
+    """
+    push_x, push_y = 0.0, 0.0
+    for pos_x, pos_y in danger_positions:
+        away_x, away_y = me_x - pos_x, me_y - pos_y
+        distance = math.hypot(away_x, away_y)
+        if distance == 0:
+            continue
+        weight = 1.0 / distance
+        push_x += away_x / distance * weight
+        push_y += away_y / distance * weight
     return push_x, push_y
 
 
+def _predicted_prey_position(
+    me_x: float, me_y: float, blob, size: float
+) -> tuple[float, float]:
+    """Where a prey blob will likely be if it flees straight away from us.
+
+    Clamped to the arena bounds, so a prey fleeing into a wall predicts a
+    position pinned against that wall -- aiming here instead of at its current
+    position naturally cuts the corner instead of trailing directly behind.
+    """
+    away_x, away_y = blob.pos[0] - me_x, blob.pos[1] - me_y
+    distance = math.hypot(away_x, away_y)
+    if distance == 0:
+        return blob.pos
+    unit_x, unit_y = away_x / distance, away_y / distance
+    predicted_x = blob.pos[0] + unit_x * INTERCEPT_LOOKAHEAD
+    predicted_y = blob.pos[1] + unit_y * INTERCEPT_LOOKAHEAD
+    predicted_x = min(max(predicted_x, blob.radius), size - blob.radius)
+    predicted_y = min(max(predicted_y, blob.radius), size - blob.radius)
+    return (predicted_x, predicted_y)
+
+
+def _dangerous_virus_positions(me_x: float, me_y: float, my_radius: float, my_strongest_mass: float, viruses):
+    """Positions of viruses we're big enough (in our strongest blob) to be
+    split by and close enough to matter.
+
+    A virus only splits a blob whose mass clears the same EAT_SIZE_RATIO rule
+    used for eating other blobs (engine/state/state_mutator.py
+    _can_consume_virus); below that we can safely sit on top of one. The
+    collision check itself only triggers once the virus's centre is inside the
+    blob's own radius, so we start steering away a bit before that (our
+    aggregate radius + buffer) to leave room to manoeuvre.
+    """
+    danger_radius = my_radius + VIRUS_AVOIDANCE_BUFFER
+    positions = []
+    for virus in viruses:
+        if my_strongest_mass <= _mass(virus.radius) * EAT_SIZE_RATIO:
+            continue
+        distance = math.hypot(me_x - virus.pos[0], me_y - virus.pos[1])
+        if 0 < distance < danger_radius:
+            positions.append(virus.pos)
+    return positions
+
+
 class HuntTracker:
-    """Cross-tick memory: last-seen prey positions (to measure their actual
-    velocity), which target we're currently committed to, and a cooldown on
-    targets we've already given up on so we don't immediately re-lock them."""
+    """Cross-tick memory for the hunt: which target we're currently locked
+    onto, and a cooldown on targets we've given up on.
+
+    Re-picking "nearest prey" from scratch every tick has the same jitter bug
+    the flee logic used to have: when two prey are similarly distant, "nearest"
+    can flip between them tick to tick, flipping our aim direction and
+    cancelling the previous tick's movement. Locking onto one target until it's
+    gone (or proven uncatchable) fixes that, and doubles as the bookkeeping
+    needed to give up on a chase that isn't actually closing the distance.
+    """
 
     def __init__(self) -> None:
-        self.last_positions: dict[int, tuple[float, float]] = {}
         self.target_id: int | None = None
         self.lock_distance: float = 0.0
         self.lock_round: int = 0
@@ -81,10 +178,7 @@ class HuntTracker:
         return round_ < self.abandoned_until.get(blob_id, -1)
 
 
-def _select_target(tracker: HuntTracker, prey_blobs, me, round_: int):
-    """Stick with the locked target as long as it's still around, giving up if
-    we haven't closed the distance over the last GIVE_UP_WINDOW_ROUNDS.
-    Otherwise lock onto the nearest eligible prey not currently on cooldown."""
+def _select_prey(tracker: HuntTracker, prey_blobs, me, round_: int):
     by_id = {blob.blob_id: blob for blob in prey_blobs}
 
     if tracker.target_id is not None and tracker.target_id in by_id:
@@ -109,78 +203,42 @@ def _select_target(tracker: HuntTracker, prey_blobs, me, round_: int):
     return nearest
 
 
-def _intercept_point(
-    tracker: HuntTracker, blob, me_x: float, me_y: float, size: float
-) -> tuple[float, float]:
-    """Predict where the prey is heading (from its measured velocity, or a
-    "flees straight away from us" guess if we've just spotted it) and aim from
-    whichever side lands closer to the arena centre, instead of trailing it
-    head-on."""
-    last_pos = tracker.last_positions.get(blob.blob_id)
-    if last_pos is not None:
-        vx, vy = blob.pos[0] - last_pos[0], blob.pos[1] - last_pos[1]
-    else:
-        vx, vy = 0.0, 0.0
-
-    if vx == 0.0 and vy == 0.0:
-        vx, vy = blob.pos[0] - me_x, blob.pos[1] - me_y
-
-    speed = math.hypot(vx, vy)
-    if speed == 0.0:
-        return blob.pos
-
-    unit_x, unit_y = vx / speed, vy / speed
-    predicted_x = blob.pos[0] + unit_x * INTERCEPT_LOOKAHEAD_TICKS
-    predicted_y = blob.pos[1] + unit_y * INTERCEPT_LOOKAHEAD_TICKS
-    predicted_x = min(max(predicted_x, blob.radius), size - blob.radius)
-    predicted_y = min(max(predicted_y, blob.radius), size - blob.radius)
-
-    perp_x, perp_y = -unit_y, unit_x
-    center = size / 2.0
-    option_a = (predicted_x + perp_x * FLANK_OFFSET, predicted_y + perp_y * FLANK_OFFSET)
-    option_b = (predicted_x - perp_x * FLANK_OFFSET, predicted_y - perp_y * FLANK_OFFSET)
-    dist_a = (option_a[0] - center) ** 2 + (option_a[1] - center) ** 2
-    dist_b = (option_b[0] - center) ** 2 + (option_b[1] - center) ** 2
-    return option_a if dist_a < dist_b else option_b
-
-
 def choose_direction(game: Game, tracker: HuntTracker) -> tuple[float, float]:
     me = game.state.me
-    my_mass = _mass(me.radius)
+    weakest_mass, strongest_mass = _weakest_and_strongest_mass(me)
     size = game.state.map.size
     round_ = game.state.round
     # visible_blobs includes our own blobs, so filter those out first.
     enemies = [blob for blob in game.state.visible_blobs if blob.player_id != me.player_id]
 
-    threats = [
-        (blob.pos[0] - me.x, blob.pos[1] - me.y)
-        for blob in enemies
-        if _mass(blob.radius) > my_mass * EAT_SIZE_RATIO
-    ]
-    if threats:
-        nearest = min(threats, key=lambda pos: pos[0] ** 2 + pos[1] ** 2)
-        flee_x, flee_y = -nearest[0], -nearest[1]
-        push_x, push_y = _boundary_push(me.x, me.y, size)
-        result = (flee_x + push_x, flee_y + push_y)
-    else:
-        prey_blobs = [blob for blob in enemies if _mass(blob.radius) < my_mass * HUNT_MASS_RATIO]
-        target = _select_target(tracker, prey_blobs, me, round_)
-        if target is not None:
-            target_x, target_y = _intercept_point(tracker, target, me.x, me.y, size)
-            result = (target_x - me.x, target_y - me.y)
-        elif game.state.visible_food:
-            target_food = min(
-                game.state.visible_food,
-                key=lambda food: (food.pos[0] - me.x) ** 2 + (food.pos[1] - me.y) ** 2,
-            )
-            result = (target_food.pos[0] - me.x, target_food.pos[1] - me.y)
-        else:
-            result = (1.0, 0.0)
+    # Priority 1 [Stage 1 + 3a + 3d + 3e]: flee anyone who could eat our
+    # weakest blob, and steer away from any virus our strongest blob would be
+    # split by -- both blended into one vector so escaping a threat can't
+    # blindly run us into a virus (and vice versa).
+    threats = [blob for blob in enemies if _mass(blob.radius) > weakest_mass * EAT_SIZE_RATIO]
+    virus_positions = _dangerous_virus_positions(me.x, me.y, me.radius, strongest_mass, game.state.visible_viruses)
+    if threats or virus_positions:
+        danger_positions = [blob.pos for blob in threats] + virus_positions
+        flee_x, flee_y = _repulsion_vector(me.x, me.y, danger_positions)
+        return _slide_off_walls(flee_x, flee_y, me.x, me.y, size)
 
-    # Must happen last: _intercept_point above needs last tick's positions to
-    # measure velocity, so only overwrite them once we're done using them.
-    tracker.last_positions = {blob.blob_id: blob.pos for blob in enemies}
-    return result
+    # Priority 2 [Stage 2 + Stage 3 + Stage 3c + 3e]: chase a locked-on,
+    # safe-to-eat prey (using our strongest blob's mass, since only that blob
+    # can actually land the kill), giving up on chases that aren't closing.
+    prey_blobs = [blob for blob in enemies if _mass(blob.radius) < strongest_mass * HUNT_MASS_RATIO]
+    target = _select_prey(tracker, prey_blobs, me, round_)
+    if target is not None:
+        target_x, target_y = _predicted_prey_position(me.x, me.y, target, size)
+        return (target_x - me.x, target_y - me.y)
+
+    # Priority 3 [Stage 1 baseline]: nothing worth fighting nearby, fall back to food.
+    if game.state.visible_food:
+        food_target = min(
+            game.state.visible_food,
+            key=lambda food: (food.pos[0] - me.x) ** 2 + (food.pos[1] - me.y) ** 2,
+        )
+        return (food_target.pos[0] - me.x, food_target.pos[1] - me.y)
+    return (1.0, 0.0)
 
 
 def main() -> None:
