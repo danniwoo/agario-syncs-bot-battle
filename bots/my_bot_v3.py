@@ -1,6 +1,29 @@
-# v2.7 builds on top of my_bot_v2_6.py (Stage 1 - 3g). Merges the 4 isolated
-# features (out of 8 ported from v5.py/v5_1.py and tested individually vs
-# v2.6, 4-5 headless runs each) that showed a clear improvement head-to-head:
+# v3 builds on my_bot_v2_7.py (Stage 1 - 3o) and attacks the late-game mass
+# ceiling head-on. The diagnosis (all three are math, not vibes):
+#
+#   1. Food economics cap out around mass 3-5: break-even needs mass/11.25
+#      pellets per tick (pellet = 0.0225 mass, decay = 0.002*mass/tick), and
+#      pellet spacing/travel time makes that unreachable past mass ~5. Our
+#      leaderboard average (~3.6) sat exactly at the food-only equilibrium.
+#   2. The split-lunge trigger window (radius*1.15, 5.0] became EMPTY at
+#      radius >= 4.35 (mass ~19), silently disabling our only burst weapon
+#      right when walking speed (0.79 at r=5 vs prey ~1.0) makes ordinary
+#      chases hopeless. -> Stage 4a scales the window with radius.
+#   3. Viruses are +2.25 mass each (100 pellets), 6 on the map, respawn on
+#      consumption -- the densest renewable income in the game, and we only
+#      ever treated them as hazards. The top leaderboard bot visibly "walks
+#      into" viruses on purpose: at its size the 16 scatter pieces are too
+#      big for anyone to punish, so it's free income. -> Stage 4b feeds on
+#      viruses when we're big enough and nobody visible can punish it.
+#
+# Also, decay half-life is ~347 ticks, so final mass mostly reflects income
+# in the last few hundred rounds -- sustained late-game income (kills +
+# viruses) is what the final number measures, not mid-game peak.
+#
+# --- Inherited from v2.7 (Stage 1 - 3o) ---
+# Merged the 4 isolated features (out of 8 ported from v5.py/v5_1.py and
+# tested individually vs v2.6, 4-5 headless runs each) that showed a clear
+# improvement head-to-head:
 #
 #   Stage 3h [C] - Proactive wall/corner repulsion field: instead of only
 #     reacting once already touching a wall (_slide_off_walls), start pushing
@@ -108,7 +131,15 @@ SQRT_2 = 1.41421356
 
 # --- Stage 3j: split-lunge attack ---
 SPLIT_MIN_MASS = 2.0
-SPLIT_LUNGE_RANGE = 5.0
+# Stage 4a: the lunge trigger window used to be (radius*1.15, 5.0] -- an
+# EMPTY interval once radius >= 4.35 (mass ~19), which silently disabled our
+# only burst weapon exactly when base speed (0.79 at r=5 vs prey's ~1.0)
+# made walking chases hopeless. True kill reach is the child-spawn offset
+# (~sqrt(2)*r ahead of our centre, see engine _apply_split geometry) plus
+# the eject glide (1.6/(1-0.82) ~= 8.9); scale the trigger with radius and
+# keep a conservative slice of the glide.
+SPLIT_SPAWN_REACH = 1.41421356
+SPLIT_LUNGE_EXTRA = 5.0
 SPLIT_MIN_RANGE_FACTOR = 1.15
 SPLIT_COOLDOWN_FRAMES = 18
 BASE_PLAYER_SPEED = 1.1
@@ -120,6 +151,15 @@ MAX_CHASE_ROUNDS = 30
 CHASE_CORRIDOR_WIDTH = 4.0
 BIG_BLOB_MASS_RATIO = 0.8
 DENSE_BIG_BLOB_COUNT = 2
+
+# --- Stage 4b: virus feeding ---
+# A virus is +virus.mass (2.25 = 100 food pellets) of renewable income; the
+# only cost is being scattered into up to 16 pieces that re-merge on their
+# own. Food income mathematically cannot outpace decay past mass ~5
+# (break-even needs mass/11.25 pellets per tick), so past this size the only
+# sustainable income sources are kills and viruses. Only feed when big
+# enough that the post-split pieces aren't eatable by anyone visible.
+VIRUS_FEED_MIN_MASS = 16.0
 
 
 def _mass(radius: float) -> float:
@@ -279,6 +319,31 @@ def _dangerous_viruses(
     return dangerous
 
 
+def _find_feedable_virus(me, my_strongest_mass: float, my_blob_count: int, viruses, enemies):
+    """Stage 4b: the nearest virus we can profitably eat right now.
+
+    Mirrors _dangerous_viruses exactly inverted: we must be big enough to
+    consume it, and NO visible enemy may be big enough to eat the pieces the
+    split would scatter us into. Same check both ways keeps the two
+    behaviours consistent -- a virus is either a hazard, food, or neutral,
+    never both."""
+    if my_strongest_mass < VIRUS_FEED_MIN_MASS:
+        return None
+    best = None
+    best_dist = float("inf")
+    for virus in viruses:
+        if my_strongest_mass <= _mass(virus.radius) * EAT_SIZE_RATIO:
+            continue
+        piece_mass = _predicted_piece_mass(my_strongest_mass, my_blob_count, virus.radius)
+        if any(_mass(enemy.radius) > piece_mass * EAT_SIZE_RATIO for enemy in enemies):
+            continue
+        distance = math.hypot(me.x - virus.pos[0], me.y - virus.pos[1])
+        if distance < best_dist:
+            best_dist = distance
+            best = virus
+    return best
+
+
 def _is_corner_pinned(pos: tuple[float, float], radius: float, size: float) -> bool:
     near_x_wall = pos[0] <= radius + CORNER_PIN_MARGIN or pos[0] >= size - radius - CORNER_PIN_MARGIN
     near_y_wall = pos[1] <= radius + CORNER_PIN_MARGIN or pos[1] >= size - radius - CORNER_PIN_MARGIN
@@ -396,7 +461,8 @@ def _should_split_hunt(me, my_strongest_mass: float, target, enemies, viruses) -
         return False
     distance = math.hypot(target.pos[0] - me.x, target.pos[1] - me.y)
     already_in_reach = distance <= me.radius * SPLIT_MIN_RANGE_FACTOR
-    if already_in_reach or distance > SPLIT_LUNGE_RANGE:
+    lunge_range = me.radius * SPLIT_SPAWN_REACH + SPLIT_LUNGE_EXTRA
+    if already_in_reach or distance > lunge_range:
         return False
     piece_mass = my_strongest_mass / 2.0
     return _split_kill_is_safe(me.x, me.y, piece_mass, len(me.blobs), target, enemies, viruses)
@@ -550,7 +616,14 @@ def choose_direction(game: Game, tracker: HuntTracker) -> tuple[float, float, bo
             return (target_x - me.x, target_y - me.y, should_split)
         tracker.give_up(target.blob_id, round_)
 
-    # Priority 4 [Stage 3l]: nothing worth fighting nearby, fall back to food
+    # Priority 4 [Stage 4b]: no prey worth chasing -- feed on a virus if
+    # we're big enough that food can no longer outpace decay (a virus is
+    # worth ~100 pellets) and nobody visible can punish the split.
+    feed_virus = _find_feedable_virus(me, strongest_mass, len(me.blobs), game.state.visible_viruses, enemies)
+    if feed_virus is not None:
+        return (feed_virus.pos[0] - me.x, feed_virus.pos[1] - me.y, False)
+
+    # Priority 5 [Stage 3l]: nothing worth fighting nearby, fall back to food
     # -- skipping any pellet sitting in a corner we're too big to ever reach
     # (same geometry as _is_corner_deadlocked above; without this we could
     # beeline for a corner pellet forever and never actually get it).
